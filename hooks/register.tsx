@@ -1,0 +1,423 @@
+import { atom, read, update } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code'
+
+import type { Level, Suggestion } from '../types'
+import {
+  LEVELS,
+  SCOUT_MARK,
+  SCOUT_PROMPT,
+  acceptPrompt,
+  lookPrompt,
+  taskPhrase,
+  parseVerdict,
+  passesLevel,
+  shouldCheck,
+  toLevel,
+} from './scout'
+import type { TurnStats } from './scout'
+
+const PANE = 'even-better'
+// The theme's soft purple: light on a dark theme, deeper on a light one.
+const ACCENT = 'merged'
+const SCOUT = 'even-better:scout'
+const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
+
+const suggestion = atom({ plugin: 'even-better', key: 'suggestion' } as const, null)
+const isScouting = atom({ plugin: 'even-better', key: 'isScouting' } as const, false)
+// "Look for an even better way?" waits in the band for the person's press.
+const isOffered = atom({ plugin: 'even-better', key: 'isOffered' } as const, false)
+
+type Turn = { request: string; answer: string; stats: TurnStats }
+
+// Module state; a reload starts it over.
+const mod = {
+  // The main loop's current turn.
+  request: '',
+  stats: { tools: 0, files: [] } as TurnStats,
+  isOwnTurn: false,
+  // The last finished turn: what the scout looks at.
+  last: null as Turn | null,
+  // The scout running now ('' when its id is not known yet), when it started,
+  // and every scout this load started.
+  pendingAgentId: undefined as string | undefined,
+  startedAt: 0,
+  scouts: new Set<string>(),
+  level: 'work' as Level,
+  // The turn the person asked for a look in, and whether Claude started the scout in it.
+  isLookTurn: false,
+  sawScoutCall: false,
+  // Write the decision log (the debugLog option).
+  isTracing: false,
+}
+
+// A scout that has not reported by then is given up on.
+const SCOUT_TIMEOUT_MS = 10 * 60 * 1000
+
+export const register: Register = (on, options) => {
+  const level: Level = toLevel(options.level)
+  mod.level = level
+  mod.isTracing = options.debugLog === true
+
+  on('session.start', async ($, e, next) => {
+    await trace($, `session.start: level=${level}`)
+    try {
+      const { agent } = await $.agent.register({
+        name: 'scout',
+        description: 'Even Better scout: reviews finished work and searches the web for a better approach.',
+        prompt: SCOUT_PROMPT,
+        tools: ['Read', 'Grep', 'Glob', 'WebSearch', 'WebFetch'],
+        model: 'sonnet',
+        omitClaudeMd: true,
+        maxTurns: 25,
+      })
+      await trace($, `agent registered: ${agent}`)
+    } catch (err) {
+      await trace($, `agent.register FAILED: ${String(err)}`)
+      $.ui.toast(`Even Better · could not set up its scout (${String(err)})`)
+    }
+    try {
+      await $.command.register({
+        name: 'even-better',
+        description: 'Look for an even better way to do what Claude just did',
+        argumentHint: '[level every|work|sure|manual | status]',
+      })
+    } catch (err) {
+      await trace($, `command.register FAILED: ${String(err)}`)
+    }
+    await update($, isScouting, () => false)
+    await update($, isOffered, () => false)
+
+    return next(e)
+  })
+
+  // The model is offered the scout only in the turn the person asked for a look.
+  on('agent.offer', { agent: SCOUT }, ($, e, next) => (mod.isLookTurn ? next(e) : { isOffered: false }))
+
+  on('prompt.submit', async ($, e, next) => {
+    // A scout finishing reaches the main loop twice, as its hand-back (a peer
+    // message) and as a task notification; its report is the popup's, so neither
+    // starts a turn.
+    const isDelivery = e.origin.kind === 'task-notification' || e.origin.kind === 'peer'
+    if (isDelivery && [...mod.scouts].some(id => e.text.includes(id))) {
+      await trace($, `dropped the scout's ${e.origin.kind} message`)
+      return { drop: 'Even Better scout finished' }
+    }
+
+    mod.isOwnTurn = e.origin.kind === 'plugin' && e.origin.name === $.plugin.name
+    mod.request = e.origin.kind === 'task-notification' ? '' : e.text
+    mod.stats = { tools: 0, files: [] }
+    // A new request makes the old offer stale.
+    if (!mod.isOwnTurn) await update($, isOffered, () => false)
+    await trace($, `prompt.submit: origin=${e.origin.kind} chars=${e.text.length} own=${mod.isOwnTurn}`)
+
+    return next(e)
+  })
+
+  on('tool.call', async ($, e, next) => {
+    if (e.agentId !== undefined) return next(e)
+
+    mod.stats.tools += 1
+    const input = e as unknown as Record<string, unknown>
+    if (EDIT_TOOLS.has(String(e.tool))) {
+      const path = input.file_path ?? input.notebook_path
+      if (typeof path === 'string' && !mod.stats.files.includes(path)) mod.stats.files.push(path)
+    }
+
+    // Claude starting the scout in the turn the person asked for a look.
+    if (String(e.tool) !== 'Agent' || input.subagent_type !== SCOUT) return next(e)
+    mod.sawScoutCall = true
+    mod.pendingAgentId = ''
+    await update($, isScouting, () => true)
+    const ran = await next(e)
+    const record = (ran.deny === undefined ? ran.result : undefined) as Record<string, unknown> | undefined
+    const agentId = typeof record?.agentId === 'string' ? record.agentId : undefined
+    await trace($, `Claude started the scout: agentId=${agentId ?? '(none)'} deny=${ran.deny ?? ''}`)
+    if (agentId !== undefined) mod.scouts.add(agentId)
+    // Still waiting (it was not a foreground run that already reported): know it by its id.
+    if (mod.pendingAgentId === '' && agentId !== undefined) mod.pendingAgentId = agentId
+
+    return ran
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    const result = await next(e)
+
+    // A scout's report, when it arrives as the scout's own turn.
+    if (e.agentId !== undefined) {
+      const isOurs =
+        mod.pendingAgentId === e.agentId || (mod.pendingAgentId === '' && SCOUT_MARK.test(e.answer))
+      await trace($, `subagent turn.complete: agent=${e.agentId} ours=${isOurs} pending=${mod.pendingAgentId}`)
+      if (isOurs) await handleReport($, e.answer, e.turnId)
+
+      return result
+    }
+
+    // A main-loop turn the person asked for: offer a look, never start one unasked.
+    await trace(
+      $,
+      `turn.complete: reason=${e.reason} request=${mod.request.length} tools=${mod.stats.tools} files=${mod.stats.files.length} own=${mod.isOwnTurn} level=${level}`,
+    )
+    // The look turn ended: the scout runs on, or Claude never started it.
+    if (mod.isLookTurn) {
+      mod.isLookTurn = false
+      if (!mod.sawScoutCall) {
+        mod.pendingAgentId = undefined
+        await update($, isScouting, () => false)
+        $.ui.status(undefined)
+        $.ui.toast('Even Better · the scout did not start this time.')
+      }
+      return result
+    }
+    if (e.reason !== 'answer' || mod.request === '' || mod.isOwnTurn) return result
+
+    mod.last = { request: mod.request, answer: e.answer, stats: { ...mod.stats, files: [...mod.stats.files] } }
+    if (shouldCheck(level, mod.stats)) {
+      await update($, isOffered, () => true)
+      await trace($, 'offered a look')
+    }
+
+    return result
+  })
+
+  on('command.run', { command: 'even-better' }, async ($, e) => {
+    const [verb, arg] = e.args.trim().split(/\s+/)
+
+    if (verb === 'level') {
+      const picked = arg ?? ''
+      if (!LEVELS.includes(picked as Level)) {
+        return { text: `Level is "${level}". Choose one of: ${LEVELS.join(', ')}.` }
+      }
+      const { deny } = await $.config.set({ key: 'even-better.level', value: picked })
+
+      return { text: deny ?? `Even Better level set to "${picked}".` }
+    }
+
+    if (verb === 'status') {
+      const running = mod.pendingAgentId !== undefined ? 'a scout is looking now' : 'idle'
+      return { text: `Even Better level: "${level}" — ${running}.` }
+    }
+
+    if (mod.last === null) return { text: 'Nothing to check yet: let Claude finish something first.' }
+
+    return { text: await startScout($, 'The user typed /even-better') }
+  })
+
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.props.hasSurvey) return next(e)
+
+    const s = await read($, suggestion)
+    const offered = await read($, isOffered)
+    const scouting = await read($, isScouting)
+    const { Box, Button, Text } = $.ui.resolve(e)
+
+    if (s !== null && s !== undefined) {
+      return (
+        <Box flexDirection="column">
+          <Text>
+            <Text bold color={ACCENT}>
+              ✨ Even Better ·{' '}
+            </Text>
+            <Text bold>{s.title}</Text>
+          </Text>
+          <Text>{s.summary}</Text>
+          <Box flexDirection="row" gap={1}>
+            <Button key="learn" label="Learn more" hotkey="l" onPress={() => learnMore($)} />
+            <Button key="accept" label="Accept" hotkey="a" variant="primary" onPress={() => accept($)} />
+            <Button key="decline" label="Decline" hotkey="d" onPress={() => decline($)} />
+          </Box>
+        </Box>
+      )
+    }
+
+    if (scouting) {
+      return (
+        <Text>
+          <Text color={ACCENT}>✨ Even Better · </Text>
+          <Text dimColor>looking for a better way… (this can take a minute)</Text>
+        </Text>
+      )
+    }
+
+    if (offered && mod.last !== null) {
+      return (
+        <Box flexDirection="row" gap={1}>
+          <Text>
+            <Text bold color={ACCENT}>
+              ✨ Even Better ·{' '}
+            </Text>
+            <Text>Look for a better way to {taskPhrase(mod.last.request)}?</Text>
+          </Text>
+          <Button
+            key="look"
+            label="Look"
+            hotkey="e"
+            variant="primary"
+            onPress={() => startScout($, 'The user pressed "Look" on the Even Better popup')}
+          />
+          <Button key="skip" label="Not now" hotkey="n" onPress={() => update($, isOffered, () => false)} />
+        </Box>
+      )
+    }
+
+    return next(e)
+  })
+
+  // /even-better's replies, under the mod's own name.
+  on('ui.render', { component: 'CommandOutput', props: { command: 'even-better' } }, async ($, e) => {
+    const { Text } = $.ui.resolve(e)
+
+    return (
+      <Text>
+        <Text color={ACCENT}>✨ Even Better · </Text>
+        <Text color={e.props.isErrored ? 'error' : undefined}>{e.props.text.replace(/^even-better:\s*/, '')}</Text>
+      </Text>
+    )
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const { Box, Button, Markdown, Text } = $.ui.resolve(e)
+    const s = await read($, suggestion)
+
+    if (s === null || s === undefined) {
+      return <Text dimColor>No suggestion right now.</Text>
+    }
+
+    const sources =
+      s.sources.length > 0 ? `\n\n### Sources\n${s.sources.map(x => `- [${x.title}](${x.url})`).join('\n')}` : ''
+    const text = `## ${s.title}\n\n_Confidence: ${s.confidence}_\n\n${s.summary}\n\n${s.details}${sources}`
+
+    return (
+      <Box flexDirection="column" gap={1}>
+        <Markdown key="details" text={text} />
+        <Box flexDirection="row" gap={1}>
+          <Button key="pane-accept" label="Accept" hotkey="a" variant="primary" onPress={() => accept($)} />
+          <Button key="pane-decline" label="Decline" hotkey="d" onPress={() => decline($)} />
+        </Box>
+      </Box>
+    )
+  })
+}
+
+/**
+ * Asks for a look at the last finished turn. Only ever called from something
+ * the person did (a press, a command). Auto mode refuses an agent a plugin
+ * starts unasked, so the ask goes into the conversation as the person's
+ * request and Claude starts the scout; `why` says what the person did.
+ */
+async function startScout($: EngineInterface, why: string): Promise<string> {
+  if (mod.last === null) return 'Nothing to check yet.'
+  const now = await $.clock.now()
+  if (mod.pendingAgentId !== undefined && now - mod.startedAt < SCOUT_TIMEOUT_MS) return 'A scout is already looking.'
+
+  await update($, isOffered, () => false)
+  const declined = await declinedTitles($)
+  // Known by the mark its report carries until Claude's Agent call names it.
+  mod.pendingAgentId = ''
+  mod.startedAt = now
+  mod.isOwnTurn = true
+  mod.isLookTurn = true
+  mod.sawScoutCall = false
+  mod.request = lookPrompt(taskPhrase(mod.last.request), declined)
+  mod.stats = { tools: 0, files: [] }
+  await update($, isScouting, () => true)
+  $.ui.status('✨ Even Better · looking for a better way…')
+  try {
+    await $.prompt.submit({ text: mod.request, asUser: true })
+  } catch (err) {
+    mod.isLookTurn = false
+    mod.pendingAgentId = undefined
+    await update($, isScouting, () => false)
+    $.ui.status(undefined)
+    return scoutFailed($, why, String(err))
+  }
+  await trace($, `asked Claude for a look (${why})`)
+
+  return 'Asked Claude to start the scout…'
+}
+
+async function handleReport($: EngineInterface, answer: string, id: string) {
+  if (mod.pendingAgentId === undefined) return // already handled
+
+  const verdict = parseVerdict(answer)
+  const kept: Suggestion | null =
+    verdict !== null && passesLevel(mod.level, verdict) ? { ...verdict, id } : null
+  await trace(
+    $,
+    verdict === null
+      ? `scout report unreadable: ${answer.slice(0, 300)}`
+      : `scout verdict: found=${verdict.found} confidence=${verdict.confidence} title="${verdict.title}" shown=${kept !== null}`,
+  )
+
+  mod.pendingAgentId = undefined
+  await update($, isScouting, () => false)
+  $.ui.status(undefined)
+  if (kept !== null) {
+    await update($, suggestion, () => kept)
+  } else {
+    $.ui.toast('Even Better · no clearly better way found. Nice work.')
+  }
+}
+
+async function scoutFailed($: EngineInterface, why: string, reason: string): Promise<string> {
+  await trace($, `scout could not start (${why}): ${reason}`)
+  $.ui.toast(`Even Better · the scout could not start (${reason.slice(0, 200)})`)
+  return `Could not start the scout: ${reason}`
+}
+
+async function accept($: EngineInterface) {
+  const s = await read($, suggestion)
+  if (s === null || s === undefined) return
+
+  await update($, suggestion, () => null)
+  await closePane($)
+  // A plugin's own prompt may skip its own prompt.submit hook: mark the turn here.
+  mod.isOwnTurn = true
+  mod.request = acceptPrompt(s)
+  mod.stats = { tools: 0, files: [] }
+  await $.prompt.submit({ text: mod.request, asUser: true })
+}
+
+async function decline($: EngineInterface) {
+  const s = await read($, suggestion)
+  await update($, suggestion, () => null)
+  await closePane($)
+  if (s !== null && s !== undefined) {
+    const titles = await declinedTitles($)
+    await $.store.set('declined', [...titles, s.title].slice(-50))
+  }
+}
+
+async function learnMore($: EngineInterface) {
+  await $.ui.open({ id: PANE, title: 'Even Better' })
+}
+
+// With the debugLog option on, the last decisions are written to
+// even-better.log in the temp folder (never the mod's own folder: a write
+// there would reload the mod).
+const traceLines: string[] = []
+
+async function trace($: EngineInterface, line: string) {
+  if (!mod.isTracing) return
+  try {
+    const at = new Date(await $.clock.now()).toISOString().slice(11, 19)
+    traceLines.push(`${at} ${line}`)
+    if (traceLines.length > 200) traceLines.shift()
+    const dir = (await $.env.get('TEMP')) ?? (await $.env.get('TMPDIR')) ?? '/tmp'
+    await $.fs.write(`${dir}/even-better.log`, traceLines.join('\n') + '\n')
+  } catch {
+    // Tracing never gets in the way.
+  }
+}
+
+async function declinedTitles($: EngineInterface): Promise<string[]> {
+  const stored = await $.store.get('declined')
+  return Array.isArray(stored) ? stored.filter((t): t is string => typeof t === 'string') : []
+}
+
+async function closePane($: EngineInterface) {
+  try {
+    await $.ui.close({ id: PANE })
+  } catch {
+    // Not open.
+  }
+}

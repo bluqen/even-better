@@ -1,0 +1,22 @@
+{
+  "name": "even-better",
+  "version": "0.2.0",
+  "description": "After Claude finishes some work, Even Better offers to look for a better way: a scout reviews the change and searches the web, and a popup above the prompt offers Learn more, Accept or Decline.",
+  "author": { "name": "Kavedi" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "level": {
+      "type": "string",
+      "title": "When to offer a look",
+      "description": "every: after every reply, any suggestion. work: after turns that edited files or used 3+ tools, medium/high confidence. sure: same turns, only high-confidence improvements. manual: only when you type /even-better.",
+      "default": "work",
+      "options": ["every", "work", "sure", "manual"]
+    },
+    "debugLog": {
+      "type": "boolean",
+      "title": "Debug log",
+      "description": "Write each decision Even Better makes to even-better.log in your temp folder.",
+      "default": false
+    }
+  }
+}
