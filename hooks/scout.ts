@@ -106,6 +106,38 @@ Reply with ONLY one JSON object, no prose before or after:
   "instruction": "a direct instruction Claude can follow to apply the improvement to this project"
 }`
 
+/** Web research run by the mod itself: step one, the queries. */
+export const QUERY_PROMPT = `You plan web research for the "Even Better" check. Given what the person asked, Claude's reply and the changed files, write the 2 web search queries most likely to find how experienced developers, official docs or well-known projects solve the same problem today.
+
+Reply with ONLY one JSON object: { "queries": ["first query", "second query"] }`
+
+/** Step three, the verdict: the quick check's rules, judged against research notes. */
+export const WEB_PROMPT = QUICK_PROMPT.replace(
+  'You cannot browse, so leave "sources" empty.',
+  'You also get research notes from web pages, each with its URL. Cite in "sources" only pages from those notes that back your suggestion.',
+).replace('"sources": [],', '"sources": [{ "title": "page title", "url": "https://..." }],')
+
+export function parseQueries(text: string): string[] {
+  const start = text.indexOf('{')
+  const end = text.lastIndexOf('}')
+  if (start === -1 || end <= start) return []
+  try {
+    const raw = JSON.parse(text.slice(start, end + 1)) as { queries?: unknown }
+    return Array.isArray(raw.queries)
+      ? raw.queries.filter((q): q is string => typeof q === 'string' && q.trim() !== '').map(q => clip(q.trim(), 200)).slice(0, 2)
+      : []
+  } catch {
+    return []
+  }
+}
+
+export type WebNote = { title: string; url: string; notes: string }
+
+export function webBrief(brief: string, notes: readonly WebNote[]): string {
+  const shown = notes.map(n => `--- ${n.title} (${n.url})\n${clip(n.notes, 3000)}`).join('\n\n')
+  return `${brief}\n\nResearch notes from the web:\n${shown || '(the search found nothing usable)'}`
+}
+
 export type ChangedFile = { path: string; text: string }
 
 export function quickBrief(request: string, answer: string, files: readonly ChangedFile[], declined: readonly string[]): string {

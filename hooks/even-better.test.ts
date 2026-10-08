@@ -85,29 +85,60 @@ type Seen = {
 
 const USAGE = { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
 
+type Web = {
+  // What the quick check and the web verdict answer.
+  quick?: string
+  verdict?: string
+  // Whether the mod's own web search is refused (as auto mode might).
+  isRefused?: boolean
+}
+
+const DOCS = 'https://docs.python.org/3/library/functions.html#sum'
+
 // Beneath the plugin in every flow test: store, clock, an empty band, a file
 // to read, and pass-through prompt, tool and turn events that record what
-// they saw. The quick check's model call answers with `quick.text`; an Agent
-// call (Claude running the web scout) answers as a launch.
-function world(on: On, quick: { text: string } = { text: report({ sources: [] }) }): Seen {
-  const seen: Seen = { prompts: [], checks: [] }
+// they saw. Model calls answer by their system prompt (queries, quick check,
+// web verdict); WebSearch finds the docs page and WebFetch reads it; an
+// Agent call (Claude running the web scout) answers as a launch.
+function world(on: On, web: Web = {}): Seen & { searches: string[]; fetches: string[] } {
+  const seen = { prompts: [], checks: [], searches: [] as string[], fetches: [] as string[] } as Seen & {
+    searches: string[]
+    fetches: string[]
+  }
   mock.store(on)
   mock.clock(on, { now: 1_000 })
   on('ui.render', () => ({ type: 'Box' }))
   on('fs.read', () => ({ value: 'def total(xs):\n    t = 0\n    for x in xs: t += x\n    return t\n' }))
   on('model.complete', ($, e) => {
     seen.checks.push({ prompt: String(e.prompt), model: e.model })
-    return { value: { isAnswered: true, text: quick.text, usage: USAGE } }
+    const system = String(e.system)
+    const text = /search queries/.test(system)
+      ? '{"queries": ["python sum list builtin", "python idiomatic total"]}'
+      : /research notes/.test(system)
+        ? (web.verdict ?? report({ sources: [{ title: 'sum()', url: DOCS }, { title: 'made up', url: 'https://invented.example' }] }))
+        : (web.quick ?? report({ sources: [] }))
+    return { value: { isAnswered: true, text, usage: USAGE } }
   })
   on('prompt.submit', ($, e) => {
     seen.prompts.push({ text: e.text, origin: e.origin.kind })
     return { text: e.text }
   })
-  on('tool.call', ($, e) =>
-    String(e.tool) === 'Agent'
-      ? ({ result: { status: 'completed', agentId: 'scout-7' } } as never)
-      : ({ result: {} } as never),
-  )
+  on('tool.call', ($, e) => {
+    const input = e as unknown as Record<string, unknown>
+    switch (String(e.tool)) {
+      case 'Agent':
+        return { result: { status: 'completed', agentId: 'scout-7' } } as never
+      case 'WebSearch':
+        seen.searches.push(String(input.query))
+        if (web.isRefused === true) return { deny: 'auto mode: no verdict' } as never
+        return { result: { query: input.query, results: [{ tool_use_id: 'x', content: [{ title: 'sum()', url: DOCS }] }], durationSeconds: 1 } } as never
+      case 'WebFetch':
+        seen.fetches.push(String(input.url))
+        return { result: { url: input.url, code: 200, codeText: 'OK', bytes: 10, durationMs: 1, result: 'Use the built-in sum().' } } as never
+      default:
+        return { result: {} } as never
+    }
+  })
   on('turn.complete', ($, e) => ({ text: e.answer }))
   on('session.receive', ($, e) => ({ text: e.text }))
   return seen
@@ -174,7 +205,7 @@ test('Look runs one quick Sonnet check over the changed files, with no turn of C
 })
 
 test('nothing better found: the band says so and offers the web', async ($, on) => {
-  world(on, { text: report({ found: false }) })
+  world(on, { quick: report({ found: false }) })
   await workTurn($)
   const ui = await band($)
   await ui.press({ key: 'look' })
@@ -185,8 +216,45 @@ test('nothing better found: the band says so and offers the web', async ($, on) 
   expect(await ui.find({ text: /No clearly better way/ })).toBe(undefined)
 })
 
-test('Research on the web asks Claude in the conversation; the scout report pops up', async ($, on) => {
-  const seen = world(on, { text: report({ found: false }) })
+test('Research on the web runs in the mod: search, read, judge, with no turn of Claude', async ($, on) => {
+  const seen = world(on, { quick: report({ found: false }) })
+  await workTurn($)
+  const ui = await band($)
+  await ui.press({ key: 'look' })
+  await ui.press({ key: 'web' })
+
+  expect(seen.searches).toEqual(['python sum list builtin', 'python idiomatic total'])
+  expect(seen.fetches).toEqual([DOCS])
+  expect(seen.prompts.length).toBe(1)
+  expect(seen.checks.length).toBe(3)
+  expect(seen.checks.every(c => c.model === 'sonnet')).toBe(true)
+  expect(seen.checks[2]?.prompt).toMatch(/Research notes from the web:\n--- sum\(\) \(https:\/\/docs\.python\.org/)
+
+  expect(await ui.find({ text: /Use the built-in/ })).toBeDefined()
+  expect(await ui.find({ key: 'web' })).toBe(undefined)
+})
+
+test('web sources are only pages the research actually read', async ($, on) => {
+  world(on, { quick: report({ found: false }) })
+  await workTurn($)
+  const ui = await band($)
+  await ui.press({ key: 'look' })
+  await ui.press({ key: 'web' })
+
+  // The pane Learn more opens.
+  const pane = await $.ui.mount({
+    plugin: 'even-better',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'even-better',
+    props: { title: 'Even Better', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 20 }, view: {} },
+  })
+  expect(await pane.find({ text: /docs\.python\.org/ })).toBeDefined()
+  expect(await pane.find({ text: /invented\.example/ })).toBe(undefined)
+})
+
+test('when the mod may not search, Research on the web asks Claude instead', async ($, on) => {
+  const seen = world(on, { quick: report({ found: false }), isRefused: true })
   await workTurn($)
   const ui = await band($)
   await ui.press({ key: 'look' })
@@ -204,7 +272,7 @@ test('Research on the web asks Claude in the conversation; the scout report pops
 })
 
 test('if Claude never starts the scout, the band clears', async ($, on) => {
-  world(on, { text: report({ found: false }) })
+  world(on, { quick: report({ found: false }), isRefused: true })
   await workTurn($)
   const ui = await band($)
   await ui.press({ key: 'look' })
@@ -244,7 +312,7 @@ test('Not now and Decline clear the band', async ($, on) => {
 })
 
 test('a low-confidence verdict stays hidden at the default level', async ($, on) => {
-  world(on, { text: report({ confidence: 'low' }) })
+  world(on, { quick: report({ confidence: 'low' }) })
   await workTurn($)
   const ui = await band($)
   await ui.press({ key: 'look' })
@@ -286,7 +354,7 @@ test("/even-better's replies are drawn under the name Even Better", async ($, on
 })
 
 test("the scout's report delivery is taken quietly; other deliveries pass", async ($, on) => {
-  world(on, { text: report({ found: false }) })
+  world(on, { quick: report({ found: false }), isRefused: true })
   await workTurn($)
   const ui = await band($)
   await ui.press({ key: 'look' })

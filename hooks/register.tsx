@@ -6,18 +6,22 @@ import {
   LEVELS,
   SCOUT_MARK,
   SCOUT_PROMPT,
+  QUERY_PROMPT,
   QUICK_PROMPT,
+  WEB_PROMPT,
   acceptPrompt,
   clipFile,
   lookPrompt,
+  parseQueries,
   quickBrief,
+  webBrief,
   taskPhrase,
   parseVerdict,
   passesLevel,
   shouldCheck,
   toLevel,
 } from './scout'
-import type { ChangedFile, TurnStats } from './scout'
+import type { ChangedFile, TurnStats, WebNote } from './scout'
 
 const PANE = 'even-better'
 // The theme's soft purple: light on a dark theme, deeper on a light one.
@@ -54,6 +58,8 @@ const mod = {
   sawScoutCall: false,
   // Write the decision log (the debugLog option).
   isTracing: false,
+  // The last turn was already researched on the web: don't offer it again.
+  hasSearched: false,
 }
 
 // A scout that has not reported by then is given up on.
@@ -189,6 +195,7 @@ export const register: Register = (on, options) => {
     if (e.reason !== 'answer' || mod.request === '' || mod.isOwnTurn) return result
 
     mod.last = { request: mod.request, answer: e.answer, stats: { ...mod.stats, files: [...mod.stats.files] } }
+    mod.hasSearched = false
     if (shouldCheck(level, mod.stats)) {
       await update($, isOffered, () => true)
       await trace($, 'offered a look')
@@ -216,7 +223,7 @@ export const register: Register = (on, options) => {
     }
 
     if (mod.last === null) return { text: 'Nothing to check yet: let Claude finish something first.' }
-    if (verb === 'web') return { text: await startScout($, 'The user typed /even-better web') }
+    if (verb === 'web') return { text: await webResearch($) }
 
     return { text: await quickCheck($) }
   })
@@ -235,9 +242,10 @@ export const register: Register = (on, options) => {
         ✨ Even Better ·{' '}
       </Text>
     )
-    const web = (
-      <Button key="web" label="Research on the web" hotkey="w" onPress={() => startScout($, 'The user pressed "Research on the web" on the Even Better popup')} />
+    const web = mod.hasSearched ? null : (
+      <Button key="web" label="Research on the web" hotkey="w" onPress={() => webResearch($)} />
     )
+
 
     if (s !== null && s !== undefined) {
       return (
@@ -347,41 +355,125 @@ async function quickCheck($: EngineInterface): Promise<string> {
   await update($, isClean, () => false)
   await update($, isChecking, () => true)
   try {
-    const files: ChangedFile[] = []
-    for (const path of turn.stats.files.slice(0, 4)) {
-      try {
-        const text = await $.fs.read(path)
-        if (typeof text === 'string') files.push({ path, text: clipFile(text) })
-      } catch {
-        // Gone or unreadable: the check goes on without it.
-      }
-    }
-    const done = await $.model.complete({
-      model: 'sonnet',
-      system: QUICK_PROMPT,
-      prompt: quickBrief(turn.request, turn.answer, files, await declinedTitles($)),
-      maxTokens: 2500,
-      timeoutMs: 90_000,
-    })
-    if (!done.isAnswered) {
-      await trace($, `quick check failed: ${done.reason}`)
-      $.ui.toast(`Even Better · the check could not finish (${done.reason})`)
-      return 'The check could not finish.'
-    }
+    const brief = quickBrief(turn.request, turn.answer, await readChanged($, turn), await declinedTitles($))
+    const done = await sonnet($, QUICK_PROMPT, brief)
+    if (done === null) return 'The check could not finish.'
 
-    const verdict = parseVerdict(done.text)
-    const kept: Suggestion | null =
-      verdict !== null && passesLevel(mod.level, verdict) ? { ...verdict, sources: [], id: `quick-${Date.now()}` } : null
-    await trace($, `quick check: found=${verdict?.found} confidence=${verdict?.confidence} shown=${kept !== null}`)
-    if (kept !== null) {
-      await update($, suggestion, () => kept)
-      return `Found one: ${kept.title}`
-    }
-    await update($, isClean, () => true)
-    return 'No clearly better way found.'
+    return await showVerdict($, done, [])
   } finally {
     await update($, isChecking, () => false)
   }
+}
+
+/**
+ * Web research on the last finished turn, run by the mod itself: Sonnet
+ * writes two queries, the mod searches and reads the top pages, and Sonnet
+ * judges against those notes. No agent and no turn of Claude's. Where the
+ * web tools are refused, it falls back to asking Claude to run the scout.
+ */
+async function webResearch($: EngineInterface): Promise<string> {
+  const turn = mod.last
+  if (turn === null) return 'Nothing to check yet.'
+  if ((await read($, isScouting)) || mod.pendingAgentId !== undefined) return 'Already researching.'
+
+  await update($, isOffered, () => false)
+  await update($, isClean, () => false)
+  await update($, suggestion, () => null)
+  mod.hasSearched = true
+  await update($, isScouting, () => true)
+  let done = false
+  try {
+    const brief = quickBrief(turn.request, turn.answer, await readChanged($, turn), await declinedTitles($))
+    const planned = await sonnet($, QUERY_PROMPT, brief)
+    const queries = planned === null ? [] : parseQueries(planned)
+    if (queries.length === 0) return 'The research could not start.'
+
+    // The pages to read: the top hit of each query, then the next ones.
+    const hits: { title: string; url: string }[] = []
+    for (const query of queries) {
+      const ran = await $.tool.call({ tool: 'WebSearch', query, mode: 'standard' })
+      if (ran.deny !== undefined || ran.isError === true) {
+        await trace($, `web search refused (${ran.deny ?? ran.text ?? 'error'}): falling back to Claude's scout`)
+        done = true
+        await update($, isScouting, () => false)
+        return startScout($, 'The user asked Even Better to research on the web')
+      }
+      const found = ((ran.result as { results?: unknown[] } | undefined)?.results ?? []).flatMap(r =>
+        typeof r === 'object' && r !== null && Array.isArray((r as { content?: unknown }).content)
+          ? ((r as { content: { title?: unknown; url?: unknown }[] }).content)
+          : [],
+      )
+      for (const hit of found) {
+        if (typeof hit.url === 'string' && /^https?:\/\//.test(hit.url) && !hits.some(h => h.url === hit.url)) {
+          hits.push({ title: typeof hit.title === 'string' ? hit.title : hit.url, url: hit.url })
+        }
+      }
+    }
+    await trace($, `web search: ${queries.length} queries, ${hits.length} hits`)
+
+    const notes: WebNote[] = []
+    for (const hit of hits.slice(0, 2)) {
+      const read = await $.tool.call({
+        tool: 'WebFetch',
+        url: hit.url,
+        prompt: `What does this page recommend for this task: ${taskPhrase(turn.request)}? Summarize the relevant advice, with any key code, in under 200 words.`,
+      })
+      const page = read.deny === undefined && read.isError !== true ? (read.result as { result?: unknown } | undefined) : undefined
+      if (typeof page?.result === 'string') notes.push({ ...hit, notes: page.result })
+    }
+    await trace($, `web fetch: read ${notes.length} pages`)
+
+    const judged = await sonnet($, WEB_PROMPT, webBrief(brief, notes))
+    if (judged === null) return 'The research could not finish.'
+    // Only pages it actually read may stand as sources.
+    return await showVerdict($, judged, notes.map(n => n.url))
+  } catch (err) {
+    await trace($, `web research failed: ${String(err)}`)
+    $.ui.toast(`Even Better · the research could not finish (${String(err).slice(0, 150)})`)
+    return 'The research could not finish.'
+  } finally {
+    if (!done) await update($, isScouting, () => false)
+  }
+}
+
+/** One Sonnet call; null, with a notice, when it does not answer. */
+async function sonnet($: EngineInterface, system: string, prompt: string): Promise<string | null> {
+  const done = await $.model.complete({ model: 'sonnet', system, prompt, maxTokens: 2500, timeoutMs: 90_000 })
+  if (done.isAnswered) return done.text
+
+  await trace($, `model call failed: ${done.reason}`)
+  $.ui.toast(`Even Better · the check could not finish (${done.reason})`)
+  return null
+}
+
+/** Puts a verdict up as the popup, or "nothing better found"; `sourceUrls` are the pages it may cite. */
+async function showVerdict($: EngineInterface, text: string, sourceUrls: readonly string[]): Promise<string> {
+  const verdict = parseVerdict(text)
+  const kept: Suggestion | null =
+    verdict !== null && passesLevel(mod.level, verdict)
+      ? { ...verdict, sources: verdict.sources.filter(s => sourceUrls.includes(s.url)), id: `check-${Date.now()}` }
+      : null
+  await trace($, `verdict: found=${verdict?.found} confidence=${verdict?.confidence} shown=${kept !== null}`)
+  if (kept !== null) {
+    await update($, suggestion, () => kept)
+    return `Found one: ${kept.title}`
+  }
+  await update($, isClean, () => true)
+  return 'No clearly better way found.'
+}
+
+/** The files the turn changed (at most four), each clipped; a gone or unreadable one is left out. */
+async function readChanged($: EngineInterface, turn: Turn): Promise<ChangedFile[]> {
+  const files: ChangedFile[] = []
+  for (const path of turn.stats.files.slice(0, 4)) {
+    try {
+      const text = await $.fs.read(path)
+      if (typeof text === 'string') files.push({ path, text: clipFile(text) })
+    } catch {
+      // Gone or unreadable: the check goes on without it.
+    }
+  }
+  return files
 }
 
 /**

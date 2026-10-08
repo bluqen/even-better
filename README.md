@@ -15,7 +15,7 @@ Press **Look** and a quick check (one Sonnet call, no agent) reviews your reques
 - **Learn more** opens a side panel with the full write-up, trade-offs and sources.
 - **Accept** has Claude apply the improvement.
 - **Decline** dismisses it, and the same idea won't be suggested again.
-- **Research on the web** has Claude send a read-only scout to search the web for how others solve the same problem; its verdict comes back with sources.
+- **Research on the web** searches the web for how others solve the same problem, reads the top pages, and comes back with a verdict and its sources.
 
 If nothing clearly better turns up, the bar says so and still offers **Research on the web**.
 
@@ -51,7 +51,8 @@ Set **When to offer a look** in `/config`, or type `/even-better level <level>`:
 
 - **Nothing runs until you press Look.**
 - **The quick check is cheap.** It is one Sonnet call made by the mod itself: no agent, no turn of the main conversation, and nothing for auto mode to refuse.
-- **Web research costs one turn.** Pressing **Research on the web** puts the request into the conversation, and Claude runs the scout. That keeps it working under auto mode, which refuses agents nobody asked for. The scout is read-only (it reads files and searches the web, and never edits) and runs on Sonnet in its own small context, so web pages don't fill your conversation.
+- **Web research is cheap too.** The mod runs it itself: Sonnet writes two search queries, the mod runs them and reads the top two pages, and Sonnet judges against what they say. Only pages it actually read can appear as sources. There is no agent and no turn of the main conversation, and web pages never land in it.
+- **If your permission setup refuses the mod's web search,** Research on the web falls back to asking Claude in the conversation to run a read-only scout agent instead. That route costs one turn of the main conversation.
 - **Button hotkeys** (`e`, `l`, `a`, `d`, `n`) work once the bar has focus: click it, or press `ctrl+x` then `tab`.
 - **Debug log:** turn on **Debug log** in `/config` to write each decision to `even-better.log` in your temp folder.
 
