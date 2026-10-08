@@ -21,13 +21,17 @@ If nothing clearly better turns up, the bar says so and still offers **Research 
 
 ## Install
 
-At the prompt of a Claude Code terminal session:
+At the prompt of a Claude Code terminal session, add the marketplace, then install the plugin:
 
 ```
-/plugin install even-better --marketplace bluqen/even-better
+/plugin marketplace add bluqen/even-better
 ```
 
-Answer `y` to add the marketplace, then pick a scope (user scope makes it available in every session).
+```
+/plugin install even-better@even-better
+```
+
+Pick a scope when asked (user scope makes it available in every session). The same two steps work from a shell as `claude plugin marketplace add bluqen/even-better` and `claude plugin install even-better@even-better`.
 
 ## When it offers a look
 

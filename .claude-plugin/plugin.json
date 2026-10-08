@@ -1,6 +1,6 @@
 {
   "name": "even-better",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "After Claude finishes some work, Even Better offers to look for a better way: a quick check reviews the change (with optional web research), and a popup above the prompt offers Learn more, Accept or Decline.",
   "author": { "name": "Kavedi" },
   "types": "./types/index.d.ts",
@@ -9,8 +9,7 @@
       "type": "string",
       "title": "When to offer a look",
       "description": "every: after every reply, any suggestion. work: after turns that edited files or used 3+ tools, medium/high confidence. sure: same turns, only high-confidence improvements. manual: only when you type /even-better.",
-      "default": "work",
-      "options": ["every", "work", "sure", "manual"]
+      "default": "work"
     },
     "debugLog": {
       "type": "boolean",
