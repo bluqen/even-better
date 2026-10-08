@@ -24,7 +24,7 @@ If nothing clearly better turns up, the bar says so and still offers **Research 
 At the prompt of a Claude Code terminal session:
 
 ```
-/plugin install even-better --marketplace OWNER/even-better
+/plugin install even-better --marketplace bluqen/even-better
 ```
 
 Answer `y` to add the marketplace, then pick a scope (user scope makes it available in every session).
