@@ -16,6 +16,12 @@ export type Suggestion = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'even-better': { suggestion: Suggestion | null; isScouting: boolean; isOffered: boolean }
+    'even-better': {
+      suggestion: Suggestion | null
+      isScouting: boolean
+      isOffered: boolean
+      isChecking: boolean
+      isClean: boolean
+    }
   }
 }

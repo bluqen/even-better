@@ -6,15 +6,18 @@ import {
   LEVELS,
   SCOUT_MARK,
   SCOUT_PROMPT,
+  QUICK_PROMPT,
   acceptPrompt,
+  clipFile,
   lookPrompt,
+  quickBrief,
   taskPhrase,
   parseVerdict,
   passesLevel,
   shouldCheck,
   toLevel,
 } from './scout'
-import type { TurnStats } from './scout'
+import type { ChangedFile, TurnStats } from './scout'
 
 const PANE = 'even-better'
 // The theme's soft purple: light on a dark theme, deeper on a light one.
@@ -24,8 +27,11 @@ const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
 
 const suggestion = atom({ plugin: 'even-better', key: 'suggestion' } as const, null)
 const isScouting = atom({ plugin: 'even-better', key: 'isScouting' } as const, false)
-// "Look for an even better way?" waits in the band for the person's press.
+// "Look for a better way?" waits in the band for the person's press.
 const isOffered = atom({ plugin: 'even-better', key: 'isOffered' } as const, false)
+// The quick check is running; it found nothing clearly better.
+const isChecking = atom({ plugin: 'even-better', key: 'isChecking' } as const, false)
+const isClean = atom({ plugin: 'even-better', key: 'isClean' } as const, false)
 
 type Turn = { request: string; answer: string; stats: TurnStats }
 
@@ -78,14 +84,16 @@ export const register: Register = (on, options) => {
     try {
       await $.command.register({
         name: 'even-better',
-        description: 'Look for an even better way to do what Claude just did',
-        argumentHint: '[level every|work|sure|manual | status]',
+        description: 'Look for a better way to do what Claude just did (web: research it on the web)',
+        argumentHint: '[web | level every|work|sure|manual | status]',
       })
     } catch (err) {
       await trace($, `command.register FAILED: ${String(err)}`)
     }
     await update($, isScouting, () => false)
     await update($, isOffered, () => false)
+    await update($, isChecking, () => false)
+    await update($, isClean, () => false)
 
     return next(e)
   })
@@ -93,10 +101,17 @@ export const register: Register = (on, options) => {
   // The model is offered the scout only in the turn the person asked for a look.
   on('agent.offer', { agent: SCOUT }, ($, e, next) => (mod.isLookTurn ? next(e) : { isOffered: false }))
 
+  // A scout finishing sends its report to the main conversation as a message
+  // (and a task notification). The report is the popup's: take the delivery
+  // quietly so it never reaches the chat or starts a turn.
+  on('session.receive', async ($, e, next) => {
+    if (e.agentId !== undefined || ![...mod.scouts].some(id => e.text.includes(id))) return next(e)
+    await trace($, `consumed the scout's ${e.origin.kind} delivery`)
+    return { consumed: "Even Better: the scout's report is shown in its popup" }
+  })
+
   on('prompt.submit', async ($, e, next) => {
-    // A scout finishing reaches the main loop twice, as its hand-back (a peer
-    // message) and as a task notification; its report is the popup's, so neither
-    // starts a turn.
+    // Fallback for a scout delivery that reaches the prompt instead: drop it.
     const isDelivery = e.origin.kind === 'task-notification' || e.origin.kind === 'peer'
     if (isDelivery && [...mod.scouts].some(id => e.text.includes(id))) {
       await trace($, `dropped the scout's ${e.origin.kind} message`)
@@ -106,8 +121,11 @@ export const register: Register = (on, options) => {
     mod.isOwnTurn = e.origin.kind === 'plugin' && e.origin.name === $.plugin.name
     mod.request = e.origin.kind === 'task-notification' ? '' : e.text
     mod.stats = { tools: 0, files: [] }
-    // A new request makes the old offer stale.
-    if (!mod.isOwnTurn) await update($, isOffered, () => false)
+    // A new request makes the old offer and "nothing found" stale.
+    if (!mod.isOwnTurn) {
+      await update($, isOffered, () => false)
+      await update($, isClean, () => false)
+    }
     await trace($, `prompt.submit: origin=${e.origin.kind} chars=${e.text.length} own=${mod.isOwnTurn}`)
 
     return next(e)
@@ -198,8 +216,9 @@ export const register: Register = (on, options) => {
     }
 
     if (mod.last === null) return { text: 'Nothing to check yet: let Claude finish something first.' }
+    if (verb === 'web') return { text: await startScout($, 'The user typed /even-better web') }
 
-    return { text: await startScout($, 'The user typed /even-better') }
+    return { text: await quickCheck($) }
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
@@ -208,15 +227,23 @@ export const register: Register = (on, options) => {
     const s = await read($, suggestion)
     const offered = await read($, isOffered)
     const scouting = await read($, isScouting)
+    const checking = await read($, isChecking)
+    const clean = await read($, isClean)
     const { Box, Button, Text } = $.ui.resolve(e)
+    const name = (
+      <Text bold color={ACCENT}>
+        ✨ Even Better ·{' '}
+      </Text>
+    )
+    const web = (
+      <Button key="web" label="Research on the web" hotkey="w" onPress={() => startScout($, 'The user pressed "Research on the web" on the Even Better popup')} />
+    )
 
     if (s !== null && s !== undefined) {
       return (
         <Box flexDirection="column">
           <Text>
-            <Text bold color={ACCENT}>
-              ✨ Even Better ·{' '}
-            </Text>
+            {name}
             <Text bold>{s.title}</Text>
           </Text>
           <Text>{s.summary}</Text>
@@ -224,17 +251,33 @@ export const register: Register = (on, options) => {
             <Button key="learn" label="Learn more" hotkey="l" onPress={() => learnMore($)} />
             <Button key="accept" label="Accept" hotkey="a" variant="primary" onPress={() => accept($)} />
             <Button key="decline" label="Decline" hotkey="d" onPress={() => decline($)} />
+            {s.sources.length === 0 && web}
           </Box>
         </Box>
       )
     }
 
-    if (scouting) {
+    if (checking || scouting) {
       return (
         <Text>
-          <Text color={ACCENT}>✨ Even Better · </Text>
-          <Text dimColor>looking for a better way… (this can take a minute)</Text>
+          {name}
+          <Text dimColor>
+            {checking ? 'checking for a better way…' : 'researching on the web… (this can take a minute)'}
+          </Text>
         </Text>
+      )
+    }
+
+    if (clean) {
+      return (
+        <Box flexDirection="row" gap={1}>
+          <Text>
+            {name}
+            <Text>No clearly better way found.</Text>
+          </Text>
+          {web}
+          <Button key="ok" label="OK" hotkey="o" onPress={() => update($, isClean, () => false)} />
+        </Box>
       )
     }
 
@@ -242,18 +285,10 @@ export const register: Register = (on, options) => {
       return (
         <Box flexDirection="row" gap={1}>
           <Text>
-            <Text bold color={ACCENT}>
-              ✨ Even Better ·{' '}
-            </Text>
+            {name}
             <Text>Look for a better way to {taskPhrase(mod.last.request)}?</Text>
           </Text>
-          <Button
-            key="look"
-            label="Look"
-            hotkey="e"
-            variant="primary"
-            onPress={() => startScout($, 'The user pressed "Look" on the Even Better popup')}
-          />
+          <Button key="look" label="Look" hotkey="e" variant="primary" onPress={() => quickCheck($)} />
           <Button key="skip" label="Not now" hotkey="n" onPress={() => update($, isOffered, () => false)} />
         </Box>
       )
@@ -299,10 +334,61 @@ export const register: Register = (on, options) => {
 }
 
 /**
- * Asks for a look at the last finished turn. Only ever called from something
- * the person did (a press, a command). Auto mode refuses an agent a plugin
- * starts unasked, so the ask goes into the conversation as the person's
- * request and Claude starts the scout; `why` says what the person did.
+ * The quick check of the last finished turn: one tool-less Sonnet call over
+ * the request, Claude's reply and the changed files. No agent and no turn of
+ * Claude's, so it costs little and auto mode has nothing to refuse.
+ */
+async function quickCheck($: EngineInterface): Promise<string> {
+  const turn = mod.last
+  if (turn === null) return 'Nothing to check yet.'
+  if ((await read($, isChecking)) || mod.pendingAgentId !== undefined) return 'Already looking.'
+
+  await update($, isOffered, () => false)
+  await update($, isClean, () => false)
+  await update($, isChecking, () => true)
+  try {
+    const files: ChangedFile[] = []
+    for (const path of turn.stats.files.slice(0, 4)) {
+      try {
+        const text = await $.fs.read(path)
+        if (typeof text === 'string') files.push({ path, text: clipFile(text) })
+      } catch {
+        // Gone or unreadable: the check goes on without it.
+      }
+    }
+    const done = await $.model.complete({
+      model: 'sonnet',
+      system: QUICK_PROMPT,
+      prompt: quickBrief(turn.request, turn.answer, files, await declinedTitles($)),
+      maxTokens: 2500,
+      timeoutMs: 90_000,
+    })
+    if (!done.isAnswered) {
+      await trace($, `quick check failed: ${done.reason}`)
+      $.ui.toast(`Even Better · the check could not finish (${done.reason})`)
+      return 'The check could not finish.'
+    }
+
+    const verdict = parseVerdict(done.text)
+    const kept: Suggestion | null =
+      verdict !== null && passesLevel(mod.level, verdict) ? { ...verdict, sources: [], id: `quick-${Date.now()}` } : null
+    await trace($, `quick check: found=${verdict?.found} confidence=${verdict?.confidence} shown=${kept !== null}`)
+    if (kept !== null) {
+      await update($, suggestion, () => kept)
+      return `Found one: ${kept.title}`
+    }
+    await update($, isClean, () => true)
+    return 'No clearly better way found.'
+  } finally {
+    await update($, isChecking, () => false)
+  }
+}
+
+/**
+ * Asks for web research on the last finished turn. Only ever called from
+ * something the person did (a press, a command). Auto mode refuses an agent a
+ * plugin starts unasked, so the ask goes into the conversation as the
+ * person's request and Claude starts the scout; `why` says what they did.
  */
 async function startScout($: EngineInterface, why: string): Promise<string> {
   if (mod.last === null) return 'Nothing to check yet.'
@@ -310,6 +396,8 @@ async function startScout($: EngineInterface, why: string): Promise<string> {
   if (mod.pendingAgentId !== undefined && now - mod.startedAt < SCOUT_TIMEOUT_MS) return 'A scout is already looking.'
 
   await update($, isOffered, () => false)
+  await update($, isClean, () => false)
+  await update($, suggestion, () => null)
   const declined = await declinedTitles($)
   // Known by the mark its report carries until Claude's Agent call names it.
   mod.pendingAgentId = ''

@@ -62,6 +62,14 @@ describe('parseVerdict', () => {
     expect(SCOUT_MARK.test(report())).toBe(true)
     expect(SCOUT_MARK.test('{"found": true}')).toBe(false)
   })
+
+  test('taskPhrase turns the request into the end of "Look for a better way to …?"', () => {
+    expect(taskPhrase('make a python flappy bird')).toBe('make a python flappy bird')
+    expect(taskPhrase('Can you write a random thing in Python?')).toBe('write a random thing in Python')
+    expect(taskPhrase('please Fix the login bug.')).toBe('fix the login bug')
+    expect(taskPhrase('why is this slow')).toBe('do this')
+    expect(taskPhrase('make ' + 'x'.repeat(80))).toBe('do this')
+  })
 })
 
 const BAND = {
@@ -70,33 +78,44 @@ const BAND = {
   props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 80, scroll: { offset: 0, bodyRows: 10 }, view: {} },
 } as const
 
+type Seen = {
+  prompts: { text: string; origin: string }[]
+  checks: { prompt: string; model: string }[]
+}
 
-type Seen = { prompts: { text: string; origin: string }[]; scoutCalls: number }
+const USAGE = { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
 
-// Beneath the plugin in every flow test: store, clock, an empty band, and
-// pass-through prompt, tool and turn events that record what they saw. An
-// Agent call (Claude starting the scout) answers as a background launch.
-function world(on: On): Seen {
-  const seen: Seen = { prompts: [], scoutCalls: 0 }
+// Beneath the plugin in every flow test: store, clock, an empty band, a file
+// to read, and pass-through prompt, tool and turn events that record what
+// they saw. The quick check's model call answers with `quick.text`; an Agent
+// call (Claude running the web scout) answers as a launch.
+function world(on: On, quick: { text: string } = { text: report({ sources: [] }) }): Seen {
+  const seen: Seen = { prompts: [], checks: [] }
   mock.store(on)
   mock.clock(on, { now: 1_000 })
   on('ui.render', () => ({ type: 'Box' }))
+  on('fs.read', () => ({ value: 'def total(xs):\n    t = 0\n    for x in xs: t += x\n    return t\n' }))
+  on('model.complete', ($, e) => {
+    seen.checks.push({ prompt: String(e.prompt), model: e.model })
+    return { value: { isAnswered: true, text: quick.text, usage: USAGE } }
+  })
   on('prompt.submit', ($, e) => {
     seen.prompts.push({ text: e.text, origin: e.origin.kind })
     return { text: e.text }
   })
-  on('tool.call', ($, e) => {
-    if (String(e.tool) !== 'Agent') return { result: {} } as never
-    seen.scoutCalls += 1
-    return { result: { status: 'async_launched', agentId: 'scout-7' } } as never
-  })
+  on('tool.call', ($, e) =>
+    String(e.tool) === 'Agent'
+      ? ({ result: { status: 'completed', agentId: 'scout-7' } } as never)
+      : ({ result: {} } as never),
+  )
   on('turn.complete', ($, e) => ({ text: e.answer }))
+  on('session.receive', ($, e) => ({ text: e.text }))
   return seen
 }
 
 async function workTurn($: Engine, turnId = 't1') {
   await $.prompt.submit({ text: 'write a sum function', origin: { kind: 'composer' }, wait: false })
-  await $.tool.call({ tool: 'Write', file_path: 'sum.ts', content: 'x' } as never)
+  await $.tool.call({ tool: 'Write', file_path: 'sum.py', content: 'x' } as never)
   await $.turn.complete({ answer: 'Done.', durationMs: 10, isAborted: false, turnId, reason: 'answer' })
 }
 
@@ -105,27 +124,16 @@ async function quickTurn($: Engine) {
   await $.turn.complete({ answer: '4', durationMs: 1, isAborted: false, turnId: 'q', reason: 'answer' })
 }
 
-// Claude answering the look request: it starts the scout and ends its turn.
-async function claudeStartsScout($: Engine) {
-  await $.tool.call({ tool: 'Agent', subagent_type: 'even-better:scout', description: 'scout', prompt: 'brief', run_in_background: true } as never)
-  await $.turn.complete({ answer: 'Even Better is looking.', durationMs: 5, isAborted: false, turnId: 'look', reason: 'answer' })
-}
-
-async function scoutReports($: Engine, answer = report()) {
+// Claude answering the web-research request: it runs the scout and ends its turn.
+async function claudeRunsScout($: Engine, answer = report()) {
+  await $.tool.call({ tool: 'Agent', subagent_type: 'even-better:scout', description: 'scout', prompt: 'brief' } as never)
   await $.turn.complete({ agentId: 'scout-7', answer, durationMs: 5, isAborted: false, turnId: 's', reason: 'answer' })
+  await $.turn.complete({ answer: 'The result is in the popup.', durationMs: 5, isAborted: false, turnId: 'look', reason: 'answer' })
 }
 
 const band = ($: Engine) => $.ui.mount({ ...BAND, surface: 'terminal' })
 
-async function lookAndReport($: Engine, answer = report()) {
-  const ui = await band($)
-  await ui.press({ key: 'look' })
-  await claudeStartsScout($)
-  await scoutReports($, answer)
-  return ui
-}
-
-test('a work turn only offers a look; nothing is asked until the press', async ($, on) => {
+test('a work turn only offers a look; nothing runs until the press', async ($, on) => {
   const seen = world(on)
   await workTurn($)
 
@@ -135,60 +143,88 @@ test('a work turn only offers a look; nothing is asked until the press', async (
     expect(await ui.find({ key: 'skip' })).toBeDefined()
     await ui.unmount()
   }
+  expect(seen.checks).toEqual([])
   expect(seen.prompts.length).toBe(1)
 })
 
-test('pressing Look asks Claude, in the conversation, to start the scout', async ($, on) => {
+test('the offer names the task and says "Even Better" once', async ($, on) => {
+  world(on)
+  await workTurn($)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...BAND, surface })
+    expect(await ui.find({ text: 'Look for a better way to write a sum function?' })).toBeDefined()
+    expect(JSON.stringify(await ui.drawn()).match(/Even Better/g)?.length).toBe(1)
+    await ui.unmount()
+  }
+})
+
+test('Look runs one quick Sonnet check over the changed files, with no turn of Claude', async ($, on) => {
   const seen = world(on)
   await workTurn($)
   const ui = await band($)
   await ui.press({ key: 'look' })
 
+  expect(seen.checks.length).toBe(1)
+  expect(seen.checks[0]?.model).toBe('sonnet')
+  expect(seen.checks[0]?.prompt).toMatch(/--- sum\.py\ndef total/)
+  expect(seen.prompts.length).toBe(1)
+
+  expect(await ui.find({ text: /Use the built-in/ })).toBeDefined()
+  for (const key of ['learn', 'accept', 'decline', 'web']) expect(await ui.find({ key })).toBeDefined()
+})
+
+test('nothing better found: the band says so and offers the web', async ($, on) => {
+  world(on, { text: report({ found: false }) })
+  await workTurn($)
+  const ui = await band($)
+  await ui.press({ key: 'look' })
+
+  expect(await ui.find({ text: /No clearly better way found/ })).toBeDefined()
+  expect(await ui.find({ key: 'web' })).toBeDefined()
+  await ui.press({ key: 'ok' })
+  expect(await ui.find({ text: /No clearly better way/ })).toBe(undefined)
+})
+
+test('Research on the web asks Claude in the conversation; the scout report pops up', async ($, on) => {
+  const seen = world(on, { text: report({ found: false }) })
+  await workTurn($)
+  const ui = await band($)
+  await ui.press({ key: 'look' })
+  await ui.press({ key: 'web' })
+
   const asked = seen.prompts[seen.prompts.length - 1]
   expect(asked?.origin).toBe('plugin')
   expect(asked?.text).toMatch(/even-better:scout/)
-  expect(await ui.find({ text: /looking for a better way/ })).toBeDefined()
-})
+  expect(await ui.find({ text: /researching on the web/ })).toBeDefined()
 
-test("the scout's report pops up with Learn more, Accept and Decline", async ($, on) => {
-  world(on)
-  await workTurn($)
-  const ui = await lookAndReport($)
-
+  await claudeRunsScout($)
   expect(await ui.find({ text: /Use the built-in/ })).toBeDefined()
-  for (const key of ['learn', 'accept', 'decline']) expect(await ui.find({ key })).toBeDefined()
-})
-
-test('the look turn itself offers no new look', async ($, on) => {
-  world(on)
-  await workTurn($)
-  const ui = await band($)
-  await ui.press({ key: 'look' })
-  await claudeStartsScout($)
+  expect(await ui.find({ key: 'web' })).toBe(undefined)
   expect(await ui.find({ key: 'look' })).toBe(undefined)
-  expect(await ui.find({ text: /looking for a better way/ })).toBeDefined()
 })
 
-test("if Claude never starts the scout, the band clears", async ($, on) => {
-  world(on)
+test('if Claude never starts the scout, the band clears', async ($, on) => {
+  world(on, { text: report({ found: false }) })
   await workTurn($)
   const ui = await band($)
   await ui.press({ key: 'look' })
+  await ui.press({ key: 'web' })
   await $.turn.complete({ answer: 'Sorry.', durationMs: 5, isAborted: false, turnId: 'look', reason: 'answer' })
-  expect(await ui.find({ text: /looking for/ })).toBe(undefined)
+  expect(await ui.find({ text: /researching/ })).toBe(undefined)
 })
 
 test('Accept sends Claude the fix, and that turn offers no new look', async ($, on) => {
   const seen = world(on)
   await workTurn($)
-  const ui = await lookAndReport($)
+  const ui = await band($)
+  await ui.press({ key: 'look' })
   await ui.press({ key: 'accept' })
 
   const sent = seen.prompts[seen.prompts.length - 1]
   expect(sent?.origin).toBe('plugin')
   expect(sent?.text).toMatch(/Replace the hand-rolled loop/)
 
-  await $.tool.call({ tool: 'Edit', file_path: 'sum.ts', old_string: 'a', new_string: 'b' } as never)
+  await $.tool.call({ tool: 'Edit', file_path: 'sum.py', old_string: 'a', new_string: 'b' } as never)
   await $.turn.complete({ answer: 'Applied.', durationMs: 10, isAborted: false, turnId: 't2', reason: 'answer' })
   expect(await ui.find({ key: 'accept' })).toBe(undefined)
   expect(await ui.find({ key: 'look' })).toBe(undefined)
@@ -197,22 +233,23 @@ test('Accept sends Claude the fix, and that turn offers no new look', async ($, 
 test('Not now and Decline clear the band', async ($, on) => {
   world(on)
   await workTurn($)
-  let ui = await band($)
+  const ui = await band($)
   await ui.press({ key: 'skip' })
   expect(await ui.find({ key: 'look' })).toBe(undefined)
 
   await workTurn($, 't2')
-  ui = await lookAndReport($)
+  await ui.press({ key: 'look' })
   await ui.press({ key: 'decline' })
   expect(await ui.find({ key: 'accept' })).toBe(undefined)
 })
 
-test('a low-confidence report stays hidden at the default level', async ($, on) => {
-  world(on)
+test('a low-confidence verdict stays hidden at the default level', async ($, on) => {
+  world(on, { text: report({ confidence: 'low' }) })
   await workTurn($)
-  const ui = await lookAndReport($, report({ confidence: 'low' }))
+  const ui = await band($)
+  await ui.press({ key: 'look' })
   expect(await ui.find({ key: 'accept' })).toBe(undefined)
-  expect(await ui.find({ text: /looking for/ })).toBe(undefined)
+  expect(await ui.find({ text: /No clearly better way found/ })).toBeDefined()
 })
 
 test('a quick Q&A turn offers nothing at the default level', async ($, on) => {
@@ -233,40 +270,6 @@ test('at level "manual" a work turn offers nothing', { options: { level: 'manual
   expect(await (await band($)).find({ key: 'look' })).toBe(undefined)
 })
 
-test("the scout's hand-back and task notification never reach the chat; other messages do", async ($, on) => {
-  const seen = world(on)
-  await workTurn($)
-  await lookAndReport($)
-  const before = seen.prompts.length
-
-  const handBack = await $.prompt.submit({ text: '<agent-message from="scout-7">{"evenBetter": true}</agent-message>', origin: { kind: 'peer' }, wait: false } as never)
-  const notice = await $.prompt.submit({ text: '<task-notification><task-id>scout-7</task-id></task-notification>', origin: { kind: 'task-notification' }, wait: false } as never)
-  expect(handBack).toMatchObject({ drop: expect.any(String) })
-  expect(notice).toMatchObject({ drop: expect.any(String) })
-
-  await $.prompt.submit({ text: '<agent-message from="someone-else">hi</agent-message>', origin: { kind: 'peer' }, wait: false } as never)
-  expect(seen.prompts.length).toBe(before + 1)
-})
-
-test('taskPhrase turns the request into the end of "Look for a better way to …?"', () => {
-  expect(taskPhrase('make a python flappy bird')).toBe('make a python flappy bird')
-  expect(taskPhrase('Can you write a random thing in Python?')).toBe('write a random thing in Python')
-  expect(taskPhrase('please Fix the login bug.')).toBe('fix the login bug')
-  expect(taskPhrase('why is this slow')).toBe('do this')
-  expect(taskPhrase('make ' + 'x'.repeat(80))).toBe('do this')
-})
-
-test('the offer names the task and says "Even Better" once', async ($, on) => {
-  world(on)
-  await workTurn($)
-  for (const surface of ['terminal', 'desktop'] as const) {
-    const ui = await $.ui.mount({ ...BAND, surface })
-    expect(await ui.find({ text: 'Look for a better way to write a sum function?' })).toBeDefined()
-    expect(JSON.stringify(await ui.drawn()).match(/Even Better/g)?.length).toBe(1)
-    await ui.unmount()
-  }
-})
-
 test("/even-better's replies are drawn under the name Even Better", async ($, on) => {
   world(on)
   for (const surface of ['terminal', 'desktop'] as const) {
@@ -280,4 +283,22 @@ test("/even-better's replies are drawn under the name Even Better", async ($, on
     expect(await ui.find({ text: /even-better:/ })).toBe(undefined)
     await ui.unmount()
   }
+})
+
+test("the scout's report delivery is taken quietly; other deliveries pass", async ($, on) => {
+  world(on, { text: report({ found: false }) })
+  await workTurn($)
+  const ui = await band($)
+  await ui.press({ key: 'look' })
+  await ui.press({ key: 'web' })
+  await claudeRunsScout($)
+
+  const scout = await $.session.receive({
+    origin: { kind: 'peer-send-message' },
+    text: '<agent-message from="scout-7">{"evenBetter": true}</agent-message>',
+  } as never)
+  expect(scout).toMatchObject({ consumed: expect.any(String) })
+
+  const other = await $.session.receive({ origin: { kind: 'peer-send-message' }, text: 'hello from someone else' } as never)
+  expect(other).toMatchObject({ text: 'hello from someone else' })
 })

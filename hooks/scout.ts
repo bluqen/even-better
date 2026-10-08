@@ -89,6 +89,37 @@ export function parseVerdict(text: string): Verdict | null {
   }
 }
 
+/** The quick check: one tool-less model call over the change itself. */
+export const QUICK_PROMPT = `You are the "Even Better" quick check. Claude (the main assistant) just finished a task. You get what the person asked, Claude's reply and the files Claude changed. Decide whether there is a clearly better way to have done it.
+
+A "better way" must be concretely better: simpler, more correct, safer, faster, more idiomatic, or a standard/built-in instead of hand-rolled code. Style nitpicks and personal taste do not count. If what Claude did is already good, say so (found: false); being honest matters more than finding something. You cannot browse, so leave "sources" empty.
+
+Reply with ONLY one JSON object, no prose before or after:
+{
+  "evenBetter": true,
+  "found": boolean,
+  "confidence": "low" | "medium" | "high",
+  "title": "short name of the better way (max ~8 words)",
+  "summary": "1-2 plain sentences: what to change and why it's better",
+  "details": "markdown: what Claude did, the better approach, why it's better, trade-offs, a short code sketch if useful",
+  "sources": [],
+  "instruction": "a direct instruction Claude can follow to apply the improvement to this project"
+}`
+
+export type ChangedFile = { path: string; text: string }
+
+export function quickBrief(request: string, answer: string, files: readonly ChangedFile[], declined: readonly string[]): string {
+  const shown = files.length > 0 ? files.map(f => `--- ${f.path}\n${f.text}`).join('\n\n') : '(no files were changed)'
+  const skip = declined.length > 0 ? `\n\nThe person already declined these ideas; do not suggest them again:\n${declined.map(t => `- ${t}`).join('\n')}` : ''
+
+  return `The person asked:\n"""\n${clip(request, 3000)}\n"""\n\nClaude's reply:\n"""\n${clip(answer, 3000)}\n"""\n\nFiles Claude changed:\n${shown}${skip}`
+}
+
+/** A changed file's text as the quick check is shown it: at most `max` characters. */
+export function clipFile(text: string, max = 8000): string {
+  return clip(text, max)
+}
+
 const VERBS = new Set([
   'add', 'build', 'change', 'clean', 'code', 'convert', 'create', 'debug', 'design', 'do', 'fix', 'generate',
   'implement', 'improve', 'make', 'move', 'optimize', 'refactor', 'remove', 'rename', 'rewrite', 'set', 'test',

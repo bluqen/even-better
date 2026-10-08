@@ -1,7 +1,7 @@
 {
   "name": "even-better",
-  "version": "0.2.0",
-  "description": "After Claude finishes some work, Even Better offers to look for a better way: a scout reviews the change and searches the web, and a popup above the prompt offers Learn more, Accept or Decline.",
+  "version": "0.3.0",
+  "description": "After Claude finishes some work, Even Better offers to look for a better way: a quick check reviews the change (with optional web research), and a popup above the prompt offers Learn more, Accept or Decline.",
   "author": { "name": "Kavedi" },
   "types": "./types/index.d.ts",
   "userConfig": {
