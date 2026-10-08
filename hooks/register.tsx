@@ -117,11 +117,12 @@ export const register: Register = (on, options) => {
   })
 
   on('prompt.submit', async ($, e, next) => {
-    // Fallback for a scout delivery that reaches the prompt instead: drop it.
+    // The scout's hand-back arrives here as a peer message: drop it, so it
+    // costs no turn. Claude Code shows the reason as a notice.
     const isDelivery = e.origin.kind === 'task-notification' || e.origin.kind === 'peer'
     if (isDelivery && [...mod.scouts].some(id => e.text.includes(id))) {
       await trace($, `dropped the scout's ${e.origin.kind} message`)
-      return { drop: 'Even Better scout finished' }
+      return { drop: "✨ Even Better · the scout's report is in the popup (kept out of the chat so it costs nothing)" }
     }
 
     mod.isOwnTurn = e.origin.kind === 'plugin' && e.origin.name === $.plugin.name
