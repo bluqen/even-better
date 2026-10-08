@@ -1,6 +1,6 @@
 {
   "name": "even-better",
   "description": "Even Better: after Claude finishes some work, look for a better way to have done it.",
-  "owner": { "name": "Kavedi" },
+  "owner": { "name": "bluqen" },
   "plugins": [{ "name": "even-better", "source": "./" }]
 }
